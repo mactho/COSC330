@@ -5,6 +5,7 @@
 #include "gaussianLib.h"
 #define KERNEL_DIMENSION_SD 3
 #define KERNEL_BITMAP_FILENAME "kernel.bmp"
+#define COLOUR_DEPTH 24
 #define DEBUG 1
 
 /* Argument parsing... Unfinished */
@@ -40,20 +41,20 @@ int main( int argc, char** argv )
 	int nproc, me, err;
 	
 	/* Declare buffers */
-	UCHAR *redBuf,*greenBuf, *blueBuf, *redSegment, *greenSegment, *blueSegment;
-	
-	/* Declare Matrices */
-	UCHAR **redMat, **greenMat, **blueMat, **smallRedMat, **smallGreenMat, **smallBlueMat;
-		
+	UCHAR *redBuf,*greenBuf, *blueBuf, *redSeg, *greenSeg, *blueSeg;
+	UCHAR *redSeg1, *greenSeg1, *blueSeg1;	
 	unsigned int heightseg;
 	unsigned long segLength;	
 
 	BMP* bmp;
-	BMP* temp;
+	BMP* temp1;
+	BMP* temp2;
+	BMP* temp1_blur;
+	BMP* temp2_blur;
 	
-	int index;
+	int index, overlap;
 	float colour_max, kernel_max;
-	int x,y, row, col;
+	int row, col;
 	int width, height;
 	float sd, kernel_dim, origin;
 	float **kernel;
@@ -71,14 +72,15 @@ int main( int argc, char** argv )
 		fprintf( stderr, "Setting up Comm size failed!....Exiting" );
 		return err;
 	}
-
-	/* setup the gaussian blur kernel and create it */
 	
+	/* setup the gaussian blur kernel and create it */
+	printf( "sd is: %d\n", atoi( argv[3] ) );
 	/*Standard Deviation of the Gaussian */
-	sd = atoi (argv[3]);
+	sd = atoi( argv[3] );
 	/*The kernel dimensions are deterined by th sd. Pixels beyond 3 standard deviations have 
 	practiaclly on impact on the value for the origin cell */
 	kernel_dim = (2 * (KERNEL_DIMENSION_SD * sd)) + 1;
+	
 	/*The center cell of the kernel */
 	origin = KERNEL_DIMENSION_SD * sd;
 	/* Now Lets allocate our Gaussian Kernel - The dimensions of the kernel will be 2*3*sd by 2*3*sd) */
@@ -87,12 +89,7 @@ int main( int argc, char** argv )
 		kernel[row] = (float *) malloc( kernel_dim * sizeof (float) );
 	}
 	
-	generateGaussianKernel (kernel, kernel_dim, sd, origin, &kernel_max, &colour_max);
-
-		for( row = 0; row < kernel_dim; row++ ){
-			free( kernel[row] );
-		}
-		free( kernel );
+		
 	/* ROOT ONLY !!! */
 	if( me == 0 ){
 
@@ -108,43 +105,80 @@ int main( int argc, char** argv )
 		
 		heightseg = height / nproc;
 		segLength = heightseg * width;
+		overlap = (int)( KERNEL_DIMENSION_SD * sd );
 		
-		/* Create large matrix to hold data for the entire input BMP */
-		redMat = createMatrix( height, width );
-		greenMat = createMatrix( height, width );
-		blueMat = createMatrix( height, width );
-
-		printf( "lllllll: %d\n", redMat[345][517] );
 		printf( "Number of processes: %d\n", nproc );
 		
-		for( x = 0 ; x < width ; x++ ){
-			for( y = 0 ; y < height ; y++ ){
-				BMP_GetPixelRGB( bmp, x, y, &redMat[y][x], &greenMat[y][x], &blueMat[y][x] );
-			}
-		}
-		if( DEBUG == 1 )printf( "last in array: %d %d %d\n", redMat[345][517], height, width );
-		BMP_Free( bmp );
-		
 		/* Create send buffers for SCATTER functions */
-		redBuf = (UCHAR *) calloc( nproc, segLength * sizeof( UCHAR ) );
-		greenBuf = (UCHAR *) calloc( nproc, segLength * sizeof( UCHAR ) );
-		blueBuf = (UCHAR *) calloc( nproc, segLength * sizeof( UCHAR ) );	
+		redBuf = (UCHAR *)calloc( width * height, sizeof( UCHAR ) );
+		greenBuf = (UCHAR *)calloc( width * height, sizeof( UCHAR ) );
+		blueBuf = (UCHAR *)calloc( width * height,  sizeof( UCHAR ) );	
 		
-		/* Flatten matrix into buffers for SCATTER */
+		/* Flatten image into buffers for SCATTER */
 		index = 0;
 		for( row = 0 ; row < height ; row++ ){
 			for( col = 0 ; col < width ; col++ ){
-				redBuf[index] = redMat[row][col];
-				greenBuf[index] = greenMat[row][col];
-				blueBuf[index] = blueMat[row][col];
+				BMP_GetPixelRGB( bmp, col, row, &redBuf[index], &greenBuf[index], &blueBuf[index] ); 
 				index++;
 			}
 		}
-	}
+		BMP_Free( bmp );
+		
+		/* break the buffers into chucks, normally will be done by scatter */
+		redSeg = (UCHAR *) calloc( segLength, sizeof( UCHAR ) );
+		greenSeg = (UCHAR *) calloc( segLength, sizeof( UCHAR ) );
+		blueSeg = (UCHAR *) calloc( segLength, sizeof( UCHAR ) );
+		redSeg1 = (UCHAR *) calloc( segLength, sizeof( UCHAR ) );
+		greenSeg1 = (UCHAR *) calloc( segLength, sizeof( UCHAR ) );
+		blueSeg1 = (UCHAR *) calloc( segLength, sizeof( UCHAR ) );
+		
+		for( row = 0 ; row < height * width ; row++ ){
+			if( row < segLength ){
+				redSeg[row] = redBuf[row];
+				greenSeg[row] = greenBuf[row];
+				blueSeg[row] = blueBuf[row];
+			} else {
+				redSeg1[row -segLength] = redBuf[row];
+				greenSeg1[row - segLength] = greenBuf[row];
+				blueSeg1[row - segLength] = blueBuf[row];
+			}
+		}
+		
+		temp1 = BMP_Create( width, heightseg, COLOUR_DEPTH );
+		temp2 = BMP_Create( width, heightseg, COLOUR_DEPTH );
+		temp1_blur = BMP_Create( width, heightseg, COLOUR_DEPTH );
+		temp2_blur = BMP_Create( width, heightseg, COLOUR_DEPTH );
+		
+		index = 0;
+		for( row = 0 ; row < heightseg ; row++ ){
+			for( col = 0 ; col < width ; col++ ){
+				BMP_SetPixelRGB( temp1, col, row, redSeg[index], greenSeg[index], blueSeg[index] );
+				BMP_SetPixelRGB( temp2, col, row, redSeg1[index], greenSeg1[index], blueSeg1[index] );
+				index++;
+			}
+		}
+	
+		generateGaussianKernel (kernel, kernel_dim, sd, origin, &kernel_max, &colour_max);
+	
+		applyConvolution( kernel, kernel_dim, origin, colour_max, temp1, temp1_blur );
+		applyConvolution( kernel, kernel_dim, origin, colour_max, temp2, temp2_blur );
+		
+		
+		BMP_WriteFile( temp1_blur, "temp1.bmp" );
+		BMP_WriteFile( temp2_blur, "temp2.bmp" );
+		
+		BMP_Free( temp1 );
+		BMP_Free( temp2 );
 
+		for( row = 0; row < kernel_dim; row++ ){
+			free( kernel[row] );
+		}
+		free( kernel );
+	}
+	
 	/* ALL NODES */
 
-	/* Broadcast some necessary info to unpack the messages */
+	/* Broadcast some necessary info to unpack the messages 
 	if( MPI_Bcast( &segLength, 1, MPI_INT, 0, MPI_COMM_WORLD ) != MPI_SUCCESS ){
 		fprintf( stderr,"Broadcast of seglength failed\n" );
 	}
@@ -156,66 +190,53 @@ int main( int argc, char** argv )
 	}
 	if( MPI_Bcast( &height, 1, MPI_INT, 0, MPI_COMM_WORLD ) != MPI_SUCCESS ){
 		fprintf( stderr,"Broadcast of height failed\n" ); 
-	}
+	}*/
 
 	/* Allocate memory for the receive buffers */
-	redSegment = (UCHAR *) calloc( segLength, sizeof( UCHAR ) );
-	greenSegment = (UCHAR *) calloc( segLength, sizeof( UCHAR ) );
-	blueSegment = (UCHAR *) calloc( segLength, sizeof( UCHAR ) ); 
+
 	
 	/* SCATTER the data */
-	if( MPI_Scatter( redBuf, segLength, MPI_UNSIGNED_CHAR, redSegment, segLength, MPI_UNSIGNED_CHAR, 0, MPI_COMM_WORLD ) != MPI_SUCCESS ){
+/*	
+	if( MPI_Scatter( &redBuf, segLength, MPI_UNSIGNED_CHAR, &redSegment, segLength, MPI_UNSIGNED_CHAR, 0, MPI_COMM_WORLD ) != MPI_SUCCESS ){
 		fprintf( stderr,"Scattering of redBuf failed\n" );
 	}
 
-	if( MPI_Scatter( greenBuf, segLength, MPI_UNSIGNED_CHAR, greenSegment, segLength, MPI_UNSIGNED_CHAR, 0, MPI_COMM_WORLD ) != MPI_SUCCESS ){
+	if( MPI_Scatter( &greenBuf, segLength, MPI_UNSIGNED_CHAR, &greenSegment, segLength, MPI_UNSIGNED_CHAR, 0, MPI_COMM_WORLD ) != MPI_SUCCESS ){
 		fprintf( stderr,"Scattering of greenBuf failed\n" );
 	}
 	
-	if( MPI_Scatter( blueBuf, segLength, MPI_UNSIGNED_CHAR, blueSegment, segLength, MPI_UNSIGNED_CHAR, 0, MPI_COMM_WORLD ) != MPI_SUCCESS ){
+	if( MPI_Scatter( &blueBuf, segLength, MPI_UNSIGNED_CHAR, &blueSegment, segLength, MPI_UNSIGNED_CHAR, 0, MPI_COMM_WORLD ) != MPI_SUCCESS ){
 		fprintf( stderr,"Scattering of blueBuf failed\n" );
 	}
-	
-	/* Allocate memory for small matrix to hold image fragment data after reconstitution */
-	smallRedMat = createMatrix( heightseg, width );
-	smallGreenMat = createMatrix( heightseg, width );
-	smallBlueMat = createMatrix( heightseg, width );
-
-	/* Reconstitute data from flattened segments into small matrix for processing !!!!! problem!!*/
-	index = 0;
-	for( row = 0 ; row < heightseg ; row++ ){
-		for( col = 0 ; col < width ; col++ ){
-			smallRedMat[row][col] = redSegment[index];
-			smallGreenMat[row][col] = greenSegment[index];
-			smallBlueMat[row][col] = blueSegment[index];
-			index++;
-		}
-	}
-	if( DEBUG == 1 )printf( "last check: %d\n", smallBlueMat[152][517] );
 	
 	if( DEBUG == 1 ){
 		printf( "node# %d Seg: %ld\n", me, segLength );
 		printf( "node# %d Width: %d\n", me, width );
-		printf( "node# %d heightseg: %ld\n", me, heightseg );
+		printf( "node# %d heightseg: %d\n", me, heightseg );
 		printf( "node# %d last: %d\n", me, blueSegment[segLength-1] );
-		printf( "last mat: %d\n", smallBlueMat[152][517] );
 	}
-	/* AS SOON AS I TRY TO DO MORE IT ALL COLLAPSES */
-
-	/* Create fragment size BMP to hold each fragment */
-	temp = BMP_Create( (UINT)width, (UINT)heightseg, 24 );
+*/	
 	
-	/*BMP_Free( temp ); */
-
+	MPI_Finalize();
+	return 0;
+}
 	
-	/* Populate the BMP with the data from the fragment matrix 
+	/* Reconstitute data from flattened segments into small matrix for processing !!!!! problem!!*/
+/*	
+	temp = BMP_Create( width, height, COLOUR_DEPTH );
+	
+	index = 0;
 	for( row = 0 ; row < heightseg ; row++ ){
 		for( col = 0 ; col < width ; col++ ){
-			BMP_SetPixelRGB( temp, col + 1, row + 1, smallRedMat[row][col], smallGreenMat[row][col], smallBlueMat[row][col] );
+			BMP_SetPixelRGB( temp, col, row, redSegment[index], greenSegment[index], blueSegment[index] );
+			index++;
 		}
-	} */
-	/*blur = BMP_Create( width, heightseg, 24 );*/
-/*	if( DEBUG == 1 ){
+	}
+	
+	 AS SOON AS I TRY TO DO MORE IT ALL COLLAPSES 
+
+	blur = BMP_Create( width, heightseg, 24 );
+	if( DEBUG == 1 ){
 		printf( "node# %d Seg: %ld\n", me, segLength );
 		printf( "node# %d Width: %d\n", me, width );
 		printf( "node# %d heightseg: %ld\n", me, heightseg );
@@ -224,38 +245,20 @@ int main( int argc, char** argv )
 		BMP_WriteFile( temp, "temp.bmp" );
 		new_bmp = BMP_Create( width, heightseg, 24 );
 		BMP_Free( temp );	
-*/		
-		/* Free the kernel memory */		
+*/				
 
 	/*	
-		for( row = 0 ; row < heightseg ; row++ ){
-			free( smallRedMat[row] );
-			free( smallGreenMat[row] );
-			free( smallBlueMat[row] );
-		}
-		free( smallRedMat );
-		free( smallGreenMat );
-		free( smallBlueMat );
 		
 		free( redSegment );
 		free( greenSegment );
 		free( blueSegment );*/
 	/*if( me == 0 ){
-		/*
-		for( row = 0 ; row < height ; row++ ){
-			free( redMat[row] );
-			free( greenMat[row] );
-			free( blueMat[row] );
-		}
-		free( redMat );
-		free( greenMat );
-		free( blueMat );
 		
 		free( redBuf );
 		free( greenBuf );
 		free( blueBuf );
 		
-		/*
+		
 		
 		redBuf = (UCHAR *) calloc( nproc, segLength * sizeof( UCHAR ) );
 		blur = BMP_Create( width, heightseg, 24 );
@@ -284,6 +287,4 @@ int main( int argc, char** argv )
 		
 
 	}*/
-	MPI_Finalize();
-	return 0;
-}
+
